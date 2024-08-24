@@ -1,16 +1,17 @@
+from math import pi
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.interpolate import interp1d
 from csv import reader
 from pid import PID
-from random import random
 
 # PID (From MATLAB Tuner)
 
-Kp = 1.2
-Ki = 0.1
+Kp = 1
+Ki = 0.4
 Kd = 0.1
-pid = PID(Kp, Ki, Kd)
+N = 50
+pid = PID(Kp=Kp, Ki=Ki, Kd=Kd, N=N, dt=0.01)
 pid.limits = (-5, 5)
 
 pid.setpoint = 0
@@ -37,8 +38,8 @@ def sign(x):
 
 
 # Engine info
-initialEngineMass = .1018
-finalEngineMass = .0418
+initialEngineMass = 0.1018
+finalEngineMass = 0.0418
 burnTime = 3.45
 
 
@@ -48,7 +49,9 @@ def f15_m(t):  # Return lerped mass of engine
     elif t < 0:
         return initialEngineMass
     else:
-        return ((finalEngineMass - initialEngineMass) * t + burnTime * initialEngineMass) / burnTime
+        return (
+            (finalEngineMass - initialEngineMass) * t + burnTime * initialEngineMass
+        ) / burnTime
 
 
 # Accel + vel
@@ -58,29 +61,29 @@ velX = 0
 velY = 0
 
 # Mass
-totalMass = .670
+totalMass = 0.670
 dryMass = totalMass - 2 * initialEngineMass  # Mass of rocket WITHOUT motors
 
 # Drag
 Cd = 1.14
 rho = 1.293
-A = .00434
+A = 0.00434
 
 # MMOI Calculation
 MOMENT_ARM = 0.15
 # STRING_LEN = 0.65
 # ROTATION_TIME = 1.603
 # MOI = totalMass * 9.81 * ROTATION_TIME**2 * MOMENT_ARM**2 / (4 * np.pi**2 * STRING_LEN)
-MOI = .0163  # kg m^2
+MOI = 0.0163  # kg m^2
 
 # Timing
 t = 0
-dt = .01
+dt = 0.01
 pid.dt = dt
 
 # Burnouts
 stage1_burnout = burnTime
-stage2_ignition = 236.1 + 32.98/9.81
+stage2_ignition = 236.1 + 32.98 / 9.81
 stage2_burnout = stage2_ignition + burnTime
 
 # Plot arrays
@@ -108,9 +111,8 @@ pitch = 90 - launchAngle
 if __name__ == "__main__":
     # Main loop
     while True:
-        DRAG = .8 * (velY ** 2) * rho * Cd * A * np.sign(velY)
-
-        gimbalAngle = pid(theta * 180/np.pi)
+        DRAG = 0.8 * (velY**2) * rho * Cd * A * np.sign(velY)
+        gimbalAngle = pid(theta * 180 / np.pi)
 
         if 0 <= t <= stage1_burnout:
             F = f15_t(t)
@@ -124,7 +126,9 @@ if __name__ == "__main__":
 
         elif stage2_ignition <= t <= stage2_burnout:
             F = f15_t(t - stage2_ignition)
-            mass = dryMass + f15_m(t - stage2_ignition)  # Mass of burning 2nd stage engine
+            mass = dryMass + f15_m(
+                t - stage2_ignition
+            )  # Mass of burning 2nd stage engine
         else:
             mass = dryMass + 2 * finalEngineMass
             gimbalAngle = 0
@@ -135,6 +139,8 @@ if __name__ == "__main__":
         gimbalAngles.append(gimbalAngle)
 
         # Torque
+        thetas.append(theta / np.pi * 180)
+
         theta += q * dt
         q += dq * dt
         x = np.sin(gimbalAngle * np.pi / 180)
@@ -146,7 +152,17 @@ if __name__ == "__main__":
         if theta > np.pi:
             theta -= 2 * np.pi
 
-        thetas.append(theta / np.pi * 180)
+        # Sensor measurement noise
+        theta += np.random.uniform(-0.2, 0.2) * pi / 180
+
+        # Integrate vel -> pos
+        alt.append(alt[-1] + velY * dt)
+        xpos.append(xpos[-1] + velX * dt)
+
+        # Integrate a -> vel
+        velX += ax * dt
+        velY += ay * dt
+        vels.append(velY)
 
         # Newton!
         ax = np.sin(theta) * aa
@@ -154,18 +170,10 @@ if __name__ == "__main__":
 
         ay -= DRAG / mass
 
-        # Integrate a -> vel
-        velX += ax * dt
-        velY += ay * dt
-        vels.append(velY)
-
-        # Integrate vel -> pos
-        alt.append(alt[-1] + velY * dt)
-        xpos.append(xpos[-1] + velX * dt)
-
         # Update timestep
-        t += dt
         time.append(t)
+        t += dt
+
 
         # We've burned all our engines and hit the ground
         if t > burnTime and alt[-1] <= 0:
@@ -182,10 +190,18 @@ if __name__ == "__main__":
     # plt.plot(time, xpos)
     # plt.plot(time, alt)
     plt.plot(time[1:], thetas[1:])
-    plt.plot(time[1:], gimbalAngles[1:])
+    plt.plot(time[1:], xpos[1:])
 
-    plt.ylim(-7, 7)
+    plt.ylim(-2, 2)
     plt.xlim(0, 10)
-    plt.legend(["XPos", "Alt", "Angle", "Gimbal"])
+    plt.legend(["Angle", "Xpos"])
 
     plt.show()
+
+for t, a, x, i, j in zip(time, alt, xpos, thetas, gimbalAngles):
+    a = round(a, 4)
+    x = round(x, 4)
+    i = round(i, 4)
+    j = round(j, 4)
+
+    print(round(t, 4), a, x, i, j, sep="\t", file=open("data.txt", "a"))
