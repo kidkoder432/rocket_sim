@@ -1,4 +1,5 @@
 import numpy as np
+from typing import Dict, Any
 
 GIMBAL_DEG = 20
 
@@ -21,3 +22,18 @@ class BangBangController(object):
 
     def reset(self):
         pass
+
+
+class DummyController(object):
+
+    def __init__(self, control):
+        
+        self.control = control
+
+    def update(self, state: Dict[str, Any]) -> float:
+        
+        return self.control
+
+    def reset(self, control: float=None):
+        if control is not None:
+            self.control = control

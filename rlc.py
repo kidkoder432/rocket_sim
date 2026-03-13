@@ -7,7 +7,7 @@ import pandas as pd
 from pprint import pprint
 import plotly.graph_objects as go
 from typing import Tuple, Dict, Any
-from sim3 import RocketSimulator, plot_results, save_results
+from sim_final import RocketSimulator, plot_results, save_results
 
 from pid import PID
 
@@ -34,6 +34,8 @@ class RocketSimRL:
         self.rocket_simulator = rocket_simulator
         self.episode_count = 0
 
+        self.prev_action = 0
+
     def reset(self, test=False) -> Dict[str, Any]:
         self.episode_count += 1
 
@@ -58,16 +60,25 @@ class RocketSimRL:
 
         self.rocket_simulator.config = current_config
 
+        self.prev_action = 0
+
         return self.rocket_simulator.reset()
 
     def step(self, action: float) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         state, done = self.rocket_simulator.step(action)
 
         loss = (
-            10 * abs(state["theta_measured_radians"])
-            + 0 * abs(state["angular_velocity"])
-            + 0 * abs(action)
+            10 * state["theta_measured_radians"]**2
+            + 5 * abs(state["angular_velocity"])**2
+            + 100 * abs(action - self.prev_action)
         )
+
+        # Penalize being pinned at the limits
+        if abs(action) >= (GIMBAL_DEG - 0.1):
+            loss *= 2.0
+
+        self.prev_action = action
+
         return state, loss, done, {}
 
     def _get_state(self):
@@ -154,7 +165,7 @@ if __name__ == "__main__":
         [1, 0, 0],
         0.5,
         {
-            "bounds": [0, 20],
+            "bounds": [-5, 5],
             "popsize": 16,
             "CMA_active": True,
         },
@@ -162,7 +173,7 @@ if __name__ == "__main__":
     theta_log = []
     loss_log = []
 
-    for gen in range(400):  # or however many you want
+    for gen in range(200):  # or however many you want
         thetas = es.ask()
         scores = [evaluate(theta, env) for theta in thetas]
 

@@ -106,7 +106,7 @@ class PID:
                 )
             else:
                 self._derivative = raw_derivative_meas
-            D = self.Kd * (-self._derivative)  # Note the negative sign
+            D = self.Kd * (self._derivative)
         else:
             D = 0.0
 
@@ -130,7 +130,7 @@ class PID:
         self._previous_measurement_deg = measurement_deg
 
         # --- Return Control Output ---
-        return output_saturated
+        return -output_saturated
 
     def reset(self):
         """Resets the integral and derivative states."""
