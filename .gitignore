@@ -3,3 +3,4 @@ extra/
 pyrocketsim.zip
 myplot.png
 .idea
+__pycache__/

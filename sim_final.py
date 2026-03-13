@@ -3,7 +3,8 @@ from scipy.interpolate import interp1d
 from csv import reader
 import os
 from pid import PID
-from controllers import BangBangController
+from gimbal import Gimbal
+from vpython import *
 
 # Added Protocol for the example usage block's type hint
 from typing import Tuple, Dict, Any, Optional, List, Protocol
@@ -23,7 +24,7 @@ def sign(x):
 THRUST_DATA_FILE = "f15.csv"
 OUTPUT_DATA_FILE = "simulation_data.csv"
 # --- Simulation Control ---
-SIMULATION_DURATION = 6
+SIMULATION_DURATION = 30
 DELTA_TIME = 0.01
 # --- Physical Constants ---
 GRAVITY = 9.80665
@@ -31,40 +32,40 @@ AIR_DENSITY = 1.293
 DRAG_COEFFICIENT = 1.14
 FRONTAL_AREA = 0.00434
 # --- Rocket Parameters ---
-INITIAL_MASS_TOTAL = 1.192
+INITIAL_MASS_TOTAL = 0.834
 ENGINE1_INITIAL_MASS = 0.1018
 ENGINE1_FINAL_MASS = 0.0418
 ENGINE1_BURN_TIME = 3.45
-ENGINE2_INITIAL_MASS = 0
-ENGINE2_FINAL_MASS = 0
+ENGINE2_INITIAL_MASS = ENGINE1_INITIAL_MASS
+ENGINE2_FINAL_MASS = ENGINE1_FINAL_MASS
 ENGINE2_BURN_TIME = ENGINE1_BURN_TIME
 STRUCTURE_MASS = INITIAL_MASS_TOTAL - ENGINE1_INITIAL_MASS - ENGINE2_INITIAL_MASS
 if STRUCTURE_MASS < 0:
     print(f"Warning: Calculated STRUCTURE_MASS ({STRUCTURE_MASS:.4f} kg) is negative.")
     STRUCTURE_MASS = 0
 # --- Staging Parameters ---
-TARGET_STAGE2_IGNITION_ALTITUDE = 15.0
+TARGET_STAGE2_IGNITION_ALTITUDE = 82
 STAGE2_IGNITION_WINDOW = 0.4
 # --- Initial Conditions ---
 LAUNCH_ANGLE_DEG = 15.0
 # --- Control System Parameters ---
-KP = 4.095
-KI = 0
-KD = 0.484
-N_FILTER = -1
+KP = 1.44168417
+KI = 2.64033837
+KD = -0.14789756
+N_FILTER = 70
 PID_SETPOINT = 0.0
 PID_OUTPUT_LIMITS = (-5, 5)
 # --- Moment Arms & Inertia ---
-MOMENT_ARM_STAGE1 = 0.3575
-MOI_STAGE1 = 0.07403
+MOMENT_ARM_STAGE1 = 0.29
+MOI_STAGE1 = 0.0739
 MOMENT_ARM_STAGE2 = 0.302
 MOI_STAGE2 = 0.0612
 # --- Simulation Options ---
-ENABLE_SENSOR_NOISE = False
+ENABLE_SENSOR_NOISE = True
 SENSOR_NOISE_STD_DEV = 0.1
-ENABLE_SERVO_DELAY = False
+ENABLE_SERVO_DELAY = True
 SERVO_DELAY_TIME = 0.04
-
+\
 
 class RocketSimulator:
     """
@@ -92,6 +93,8 @@ class RocketSimulator:
             **default_config,
             **user_config,
         }  # User config overrides defaults
+
+        self.gimbal = Gimbal()
 
         # --- Simulation Control ---
         self.dt = self.config["delta_time"]
@@ -161,7 +164,9 @@ class RocketSimulator:
         self.current_moment_arm: float = 0.0
         self.engine_thrust: float = 0.0
         self.is_burning: bool = False
+        self.drag_force_x: float = 0.0  # Store last calculated drag
         self.drag_force_y: float = 0.0  # Store last calculated drag
+        self.aoa: float = 0.0  # Angle of attack in degrees
 
         print("General RocketSimulator initialized.")
 
@@ -292,7 +297,11 @@ class RocketSimulator:
         self.current_moment_arm = self.config["moment_arm_stage1"]
         self.engine_thrust = 0.0  # Will be calculated in first step if t=0
         self.is_burning = False  # Will be determined in first step
+        self.drag_force_x = 0.0
         self.drag_force_y = 0.0
+        self.aoa = 0.0
+
+        self.gimbal.reset()
 
         # print(f"Environment reset. Initial angle: {np.degrees(self.theta_radians):.1f} deg") # Optional
         return self.get_current_state()
@@ -328,12 +337,14 @@ class RocketSimulator:
             "current_stage": self.current_stage,
             "engine_thrust": self.engine_thrust,  # Thrust applied in the *last* step
             "is_burning": self.is_burning,
+            "drag_force_x": self.drag_force_x,
             "drag_force_y": self.drag_force_y,  # Drag calculated in the *last* step
+            "angle_of_attack_deg": self.aoa,
             "gimbal_actual_deg": self.current_gimbal_angle_deg,  # Gimbal angle applied in the *last* step
             "dt": self.dt,
         }
 
-    def is_done(self) -> bool:
+    def _overtime(self) -> bool:
         """
         Checks if the simulation has reached a terminal state.
 
@@ -341,6 +352,24 @@ class RocketSimulator:
             bool: True if the simulation is done, False otherwise.
         """
         return self.time >= self.max_duration
+
+    def _crashed(self) -> bool:
+        """
+        Checks if the rocket has crashed (altitude below -1m after 1s).
+
+        Returns:
+            bool: True if the rocket has crashed, False otherwise.
+        """
+        return self.altitude < 0.0 and self.time > 1.0
+
+    def done(self) -> bool:
+        """
+        Checks if the simulation has reached a terminal state (overtime or crash).
+
+        Returns:
+            bool: True if the simulation is done, False otherwise.
+        """
+        return self._overtime() or self._crashed()
 
     def step(self, gimbal_command_deg: float) -> Tuple[Dict[str, Any], bool]:
         """
@@ -352,34 +381,10 @@ class RocketSimulator:
         Returns:
             Dict[str, Any]: The dictionary representing the new state after the step.
         """
-        # --- 1. Apply Action (Gimbal Command) ---
-        # Clipping ensures command respects physical limits defined in config
-        command_clipped = np.clip(
-            gimbal_command_deg, self.min_gimbal_angle, self.max_gimbal_angle
-        )
-        # Store the *intended* command before delay for potential logging/analysis
-        # Note: The procedural version logged commanded_gimbal_angle_deg *after* clipping
-        # which is equivalent to command_clipped here.
-        self.command_queue.append((command_clipped, self.time))
 
-        # Apply servo delay based on config
-        servo_delay = self.config.get("servo_delay_time", 0.04)
-        enable_delay = self.config.get("enable_servo_delay", True)
-
-        applied_gimbal_angle_deg = self.current_gimbal_angle_deg  # Hold previous
-        if enable_delay:
-            # Process commands older than the delay
-            while self.command_queue and (
-                self.time - self.command_queue[0][1] >= servo_delay
-            ):
-                applied_gimbal_angle_deg, _ = self.command_queue.pop(0)
-            # Update the actual angle that will be used in physics
-            self.current_gimbal_angle_deg = applied_gimbal_angle_deg
-        else:
-            # No delay, use the clipped command immediately
-            self.current_gimbal_angle_deg = command_clipped
-        # Convert the angle *actually applied* to radians for physics
-        gimbal_radians = np.radians(self.current_gimbal_angle_deg)
+        self.gimbal(gimbal_command_deg, self.time)
+        gimbal_radians = self.gimbal.get_rad()
+        self.current_gimbal_angle_deg = self.gimbal.get_deg()
 
         # --- 2. Update Stage & Dynamics ---
         # Determine current stage, mass, moi, moment_arm, thrust, burning status
@@ -458,19 +463,29 @@ class RocketSimulator:
         # --- 3. Calculate Physics ---
         # Use state determined *for this step* (thrust, mass, moi, moment_arm, gimbal_radians)
         thrust_force = self.engine_thrust
+        self.speed = np.sqrt(self.velocity_x**2 + self.velocity_y**2)
+
+        self.drag_force_x = (
+            0.5
+            * self.rho
+            * ((self.velocity_x * self.speed) if self.speed > 0 else 0.0)
+            * self.cd
+            * self.frontal_area
+        )
+
         self.drag_force_y = (
             0.5
             * self.rho
-            * (self.velocity_y**2)
+            * ((self.velocity_y * self.speed) if self.speed > 0 else 0.0)
             * self.cd
             * self.frontal_area
-            * sign(-self.velocity_y)
         )
+
         gravity_force_y = -self.g * self.current_mass
         total_angle_radians = (
             self.theta_radians + gimbal_radians
         )  # Angle of thrust vector in world frame
-        force_x = thrust_force * np.sin(total_angle_radians)
+        force_x = thrust_force * np.sin(total_angle_radians) - self.drag_force_x
         force_y = (
             thrust_force * np.cos(total_angle_radians)
             + gravity_force_y
@@ -478,17 +493,27 @@ class RocketSimulator:
         )
         acceleration_x = force_x / self.current_mass
         acceleration_y = force_y / self.current_mass
-        torque = thrust_force * np.sin(gimbal_radians) * self.current_moment_arm
+        torque = -thrust_force * np.sin(gimbal_radians) * self.current_moment_arm
         # Calculate angular acceleration *for this step*
         if self.current_moi <= 0:
             self.angular_acceleration = 0.0
         else:
             self.angular_acceleration = torque / self.current_moi
 
+        self.move_angle = np.arctan2(self.velocity_y, self.velocity_x)
+        self.aoa = np.degrees(self.theta_radians - self.move_angle) + 90
+
+        if self.velocity_y <= 0:
+            self.aoa = 0
+
         # --- 4. Integrate State ---
         # Update state variables based on accelerations calculated *this step*
         self.velocity_x += acceleration_x * self.dt
         self.velocity_y += acceleration_y * self.dt
+
+        if acceleration_y < 0 and self.time < 1:
+            self.velocity_y = max(0, self.velocity_y)
+
         self.x_position += self.velocity_x * self.dt
         self.altitude += self.velocity_y * self.dt
         self.angular_velocity += self.angular_acceleration * self.dt
@@ -498,231 +523,10 @@ class RocketSimulator:
 
         # --- 5. Return New State and Check for Done ---
         # The state dictionary reflects the results *after* this step's integration
-        return self.get_current_state(), self.is_done()
+        return self.get_current_state(), self.done()
 
-    def step_debug(self, gimbal_command_deg: float) -> Dict[str, Any]:
-        """
-        Runs one time step of the simulation using the provided gimbal command.
-        Includes NaN checks and debug prints.
-
-        Args:
-            gimbal_command_deg: The desired gimbal angle command in degrees.
-
-        Returns:
-            Dict[str, Any]: The dictionary representing the new state after the step.
-        """
-        # --- Pre-step Debug Print ---
-        print(f"\n--- Step Start: t={self.time:.2f} ---")
-        print(f"Input gimbal cmd: {gimbal_command_deg:.3f}")
-
-        # --- 1. Apply Action (Gimbal Command) ---
-        command_clipped = np.clip(
-            gimbal_command_deg, self.min_gimbal_angle, self.max_gimbal_angle
-        )
-        self.command_queue.append((command_clipped, self.time))
-
-        servo_delay = self.config.get("servo_delay_time", 0.04)
-        enable_delay = self.config.get("enable_servo_delay", True)
-        applied_gimbal_angle_deg = self.current_gimbal_angle_deg  # Hold previous
-        if enable_delay:
-            while self.command_queue and (
-                self.time - self.command_queue[0][1] >= servo_delay
-            ):
-                applied_gimbal_angle_deg, _ = self.command_queue.pop(0)
-            self.current_gimbal_angle_deg = applied_gimbal_angle_deg
-        else:
-            self.current_gimbal_angle_deg = command_clipped
-        gimbal_radians = np.radians(self.current_gimbal_angle_deg)
-        print(f"Applied gimbal angle: {self.current_gimbal_angle_deg:.3f} deg")
-
-        # --- 2. Update Stage & Dynamics ---
-        self.is_burning = False
-        self.engine_thrust = 0.0
-        # (Stage logic remains the same)
-        if self.time < self.stage1_separation_time:
-            self.current_stage = 1.0
-            engine_time = self.time
-            self.engine_thrust = self._thrust_at_time(engine_time)
-            engine1_mass = self._engine_mass_at_time(
-                engine_time,
-                self.eng1_initial_mass,
-                self.eng1_final_mass,
-                self.eng1_burn_time,
-            )
-            self.current_mass = (
-                self.structure_mass + engine1_mass + self.eng2_initial_mass
-            )
-            self.current_moi = self.moi_stage1
-            self.current_moment_arm = self.moment_arm_stage1
-            self.is_burning = True
-        elif self.time < self.stage2_ignition_time:
-            self.current_stage = 1.5
-            self.current_mass = (
-                self.structure_mass + self.eng1_final_mass + self.eng2_initial_mass
-            )
-            self.current_moi = self.moi_stage1
-            self.current_moment_arm = self.moment_arm_stage1
-            if (
-                not self.stage2_ignition_locked
-                and self.velocity_y < 0
-                and abs(self.altitude - self.target_stage2_alt)
-                <= self.stage2_alt_window
-            ):
-                self.stage2_ignition_time = self.time
-                self.stage2_ignition_altitude = self.altitude
-                self.stage2_burnout_time = (
-                    self.stage2_ignition_time + self.eng2_burn_time
-                )
-                self.stage2_ignition_locked = True
-        elif self.time < self.stage2_burnout_time:
-            self.current_stage = 2.0
-            engine_time = self.time - self.stage2_ignition_time
-            self.engine_thrust = self._thrust_at_time(engine_time)
-            engine2_mass = self._engine_mass_at_time(
-                engine_time,
-                self.eng2_initial_mass,
-                self.eng2_final_mass,
-                self.eng2_burn_time,
-            )
-            self.current_mass = (
-                self.structure_mass + self.eng1_final_mass + engine2_mass
-            )
-            self.current_moi = self.moi_stage2
-            self.current_moment_arm = self.moment_arm_stage2
-            self.is_burning = True
-        else:
-            self.current_stage = 2.5
-            self.current_mass = (
-                self.structure_mass + self.eng1_final_mass + self.eng2_final_mass
-            )
-            self.current_moi = self.moi_stage2
-            self.current_moment_arm = self.moment_arm_stage2
-
-        # --- Debug Print & Safety Check ---
-        print(
-            f"Stage: {self.current_stage}, Mass: {self.current_mass:.3f}, MOI: {self.current_moi:.4f}"
-        )
-        if np.isnan(self.current_mass) or np.isnan(self.current_moi):
-            print(f"FATAL ERROR at t={self.time:.2f}: Mass or MOI became NaN!")
-            return (
-                self.get_current_state()
-            )  # Return current state to prevent further issues
-        if self.current_mass <= 0:
-            print(
-                f"Error: Mass non-positive ({self.current_mass:.4f}) at t={self.time:.2f}. Step skipped."
-            )
-            return self.get_current_state()
-
-        # --- 3. Calculate Physics ---
-        thrust_force = self.engine_thrust
-        # Check for NaN in velocity before calculating drag
-        if np.isnan(self.velocity_y):
-            print(
-                f"FATAL ERROR at t={self.time:.2f}: Velocity Y is NaN before drag calculation!"
-            )
-            self.drag_force_y = 0.0  # Assign safe value
-        else:
-            self.drag_force_y = (
-                0.5
-                * self.rho
-                * (self.velocity_y**2)
-                * self.cd
-                * self.frontal_area
-                * sign(-self.velocity_y)
-            )
-
-        gravity_force_y = -self.g * self.current_mass
-        total_angle_radians = self.theta_radians + gimbal_radians
-        force_x = thrust_force * np.sin(total_angle_radians)
-        force_y = (
-            thrust_force * np.cos(total_angle_radians)
-            + gravity_force_y
-            + self.drag_force_y
-        )
-
-        # --- Debug Print & NaN Check ---
-        print(
-            f"Forces: Thrust={thrust_force:.2f}, DragY={self.drag_force_y:.2f}, GravY={gravity_force_y:.2f}, Fx={force_x:.2f}, Fy={force_y:.2f}"
-        )
-        if np.isnan(force_x) or np.isnan(force_y) or np.isnan(self.drag_force_y):
-            print(
-                f"FATAL ERROR at t={self.time:.2f}: Force calculation resulted in NaN!"
-            )
-            print(
-                f"  State: Alt={self.altitude:.2f}, VelY={self.velocity_y:.2f}, Theta={np.degrees(self.theta_radians):.2f}"
-            )
-            return self.get_current_state()
-
-        acceleration_x = force_x / self.current_mass
-        acceleration_y = force_y / self.current_mass
-        torque = thrust_force * np.sin(gimbal_radians) * self.current_moment_arm
-
-        if self.current_moi <= 0:
-            # print(f"Warning at t={self.time:.2f}: MOI is non-positive ({self.current_moi:.4f}). Setting angular acceleration to 0.")
-            self.angular_acceleration = 0.0
-        else:
-            self.angular_acceleration = torque / self.current_moi
-
-        # --- Debug Print & NaN Check ---
-        print(
-            f"Accelerations: Ax={acceleration_x:.3f}, Ay={acceleration_y:.3f}, Alpha={self.angular_acceleration:.3f}"
-        )
-        if (
-            np.isnan(acceleration_x)
-            or np.isnan(acceleration_y)
-            or np.isnan(self.angular_acceleration)
-        ):
-            print(
-                f"FATAL ERROR at t={self.time:.2f}: Acceleration calculation resulted in NaN!"
-            )
-            print(f"  Forces: Fx={force_x:.2f}, Fy={force_y:.2f}, Torque={torque:.3f}")
-            print(f"  Mass={self.current_mass:.3f}, MOI={self.current_moi:.4f}")
-            return self.get_current_state()
-
-        # --- 4. Integrate State ---
-        prev_vx, prev_vy = self.velocity_x, self.velocity_y
-        prev_alt, prev_x = self.altitude, self.x_position
-        prev_av, prev_theta = self.angular_velocity, self.theta_radians
-
-        self.velocity_x += acceleration_x * self.dt
-        self.velocity_y += acceleration_y * self.dt
-        self.x_position += self.velocity_x * self.dt
-        self.altitude += self.velocity_y * self.dt
-        self.angular_velocity += self.angular_acceleration * self.dt
-        self.theta_radians += self.angular_velocity * self.dt
-
-        # Advance time *after* all calculations for this step are done
-        self.time += self.dt
-
-        # --- Debug Print & NaN Check after Integration ---
-        print(
-            f"State @ t={self.time:.2f}: Alt={self.altitude:.2f}, VelY={self.velocity_y:.2f}, Theta={np.degrees(self.theta_radians):.2f}, AngVel={self.angular_velocity:.3f}"
-        )
-        state_vars = [
-            self.velocity_x,
-            self.velocity_y,
-            self.x_position,
-            self.altitude,
-            self.angular_velocity,
-            self.theta_radians,
-        ]
-        if any(np.isnan(v) for v in state_vars):
-            print(
-                f"FATAL ERROR at t={self.time:.2f}: State variable became NaN after integration!"
-            )
-            print(
-                f"  Prev State: Alt={prev_alt:.2f}, VelY={prev_vy:.2f}, Theta={np.degrees(prev_theta):.2f}, AngVel={prev_av:.3f}"
-            )
-            print(
-                f"  Accelerations: Ax={acceleration_x:.3f}, Ay={acceleration_y:.3f}, Alpha={self.angular_acceleration:.3f}"
-            )
-            # Returning current (NaN) state helps see the NaN in logs/plots
-            return self.get_current_state()
-
-        # --- 5. Return New State ---
-        # get_current_state() will retrieve the updated values.
-        return self.get_current_state(), self.is_done()
-
+    def set_target_burn_alt(self, target_altitude: float) -> None:
+        self.target_stage2_alt = target_altitude
 
 def plot_results(log: Dict[str, Any]):
     """
@@ -866,6 +670,154 @@ def plot_results(log: Dict[str, Any]):
     fig_time.show()
 
 
+def vis_results(log: Dict[str, Any]):
+    # 1. Setup Data & Scene
+    # Assuming log is a dict of lists: log['time'][i] gives the time at frame i
+    num_frames = len(log["time"])
+
+    scene = canvas(
+        title="Rocket Simulation Visualizer",
+        width=800,
+        height=600,
+        background=color.black,
+    )
+    scene.userspin = False
+    scene.autoscale = False
+
+    # Remove perspective (important for 2D)
+    scene.forward = vector(0, 0, -1)  # camera looking straight down z
+    scene.up = vector(0, 1, 0)
+
+    # 2. Geometry Setup
+    rocket_length = 1
+    rocket_radius = 0.037
+    engine_length = 0.114
+
+    # The rocket's position is its center of mass.
+    rocket = cylinder(
+        pos=vec(0, 0, 0),
+        axis=vec(0, rocket_length, 0),
+        radius=rocket_radius,
+        color=color.white,
+    )
+
+    # The engine attaches to the bottom of the rocket.
+    engine = cylinder(
+        pos=vec(0, 0, 0),
+        axis=vec(0, -engine_length, 0),
+        radius=rocket_radius * 0.5,
+        color=color.red,
+    )
+
+    ground = box(pos=vec(0, -0.11, 0), size=vec(100, 0.2, 100), color=color.green)
+
+    # 3. State Management
+    state = {
+        "frame": 0,
+        "running": False,
+        "max_frame": num_frames - 1,
+        "lock_view": True,
+    }
+
+    # 4. UI Callbacks
+    def toggle_play(b):
+        state["running"] = not state["running"]
+        b.text = "Pause" if state["running"] else "Play"
+
+    def reset_sim(b):
+        state["running"] = False
+        play_button.text = "Play"
+        state["frame"] = 0
+        time_slider.value = 0
+        update_visuals(0)
+
+    def scrub_time(s):
+        state["running"] = False
+        play_button.text = "Play"
+        state["frame"] = int(s.value)
+        update_visuals(state["frame"])
+
+    def toggle_lock_view(c):
+        state["lock_view"] = c.checked
+
+    checkbox(text="Lock view to rocket", bind=toggle_lock_view, checked=True)
+
+    scene.append_to_caption("  ")
+
+    # 5. UI Elements
+    scene.append_to_caption("\n")
+    play_button = button(text="Play", bind=toggle_play)
+    scene.append_to_caption("  ")
+    button(text="Reset", bind=reset_sim)
+    scene.append_to_caption("  Time: ")
+
+    time_slider = slider(
+        min=0, max=state["max_frame"], value=0, length=400, bind=scrub_time
+    )
+
+    scene.append_to_caption("\n\n")
+    readout = wtext(text="Data will appear here.")
+
+    # 6. Update Logic
+    def update_visuals(f: int):
+        # Extract current frame data
+        t = log["time"][f]
+        x = log["x_position"][f]
+        y = log["altitude"][f]
+        aoa = log["angle_of_attack_deg"][f]
+        theta_rad = log["theta_radians"][f]
+        gimbal_deg = log["gimbal_actual_deg"][f]
+
+        # Rocket position (assuming data gives Center of Mass)
+        rocket.pos = vec(x, y, 0)
+
+        # Calculate rocket orientation vector (assuming 0 rad is pointing straight up)
+        # If your 0 is along the x-axis, swap sin/cos accordingly.
+        rocket_dir = vec(-np.sin(theta_rad), np.cos(theta_rad), 0)
+        rocket.axis = rocket_dir * rocket_length
+
+        # Calculate engine position (bottom of the rocket)
+        # Shift back from the CoM by half the rocket's length
+        engine.pos = rocket.pos
+
+        # Calculate engine orientation (rocket angle + gimbal angle)
+        gimbal_rad = np.radians(gimbal_deg)
+        total_engine_angle = theta_rad + gimbal_rad
+        engine_dir = vec(-np.sin(total_engine_angle), np.cos(total_engine_angle), 0)
+
+        # Engine axis points downwards relative to its mounting point
+        engine.axis = -engine_dir * engine_length
+
+        if state["lock_view"]:
+            z = scene.camera.pos.z
+            scene.camera.pos = vec(x, y, z)
+
+        # Update Readout
+        data_str = f"<b>Frame:</b> {f} / {state['max_frame']} | "
+        data_str += f"<b>Time:</b> {t:.2f} s\n"
+        data_str += f"<b>Alt:</b> {y:.2f} m | <b>X:</b> {x:.2f} m\n"
+        data_str += f"<b>Theta:</b> {np.degrees(theta_rad):.2f}° | <b>Gimbal:</b> {gimbal_deg:.2f}°\n"
+        data_str += f"<b>Thrust:</b> {log['engine_thrust'][f]:.2f} N | <b>Mass:</b> {log['current_mass'][f]:.2f} kg\n"
+        data_str += f"<b>Angle of Attack:</b> {aoa:.2f}°\n"
+        data_str += f"<b>Drag Force X:</b> {log['drag_force_x'][f]:.2f} N | <b>Drag Force Y:</b> {log['drag_force_y'][f]:.2f} N"
+
+        readout.text = data_str
+
+    # 7. Main Loop
+    update_visuals(0)  # Initialize first frame
+
+    while True:
+        rate(60)  # Target 60 FPS
+        if state["running"]:
+            if state["frame"] < state["max_frame"]:
+                state["frame"] += 1
+                time_slider.value = state["frame"]
+                update_visuals(state["frame"])
+            else:
+                state["running"] = False
+                play_button.text = "Play"
+
+
 def save_results(log: Dict[str, Any], filename: str):
     """Saves key simulation data to a CSV file."""
     if not log or not log["time"]:
@@ -992,6 +944,8 @@ if __name__ == "__main__":
         limits=simulator.config["gimbal_limits"],
     )
 
+    # controller = DummyController(20)
+
     # controller = BangBangController([-3, 3])
 
     # --- Simulation Loop ---
@@ -1025,16 +979,9 @@ if __name__ == "__main__":
         # 3. Log data (log the state *after* the step)
         history.append(next_state)
 
-        # 4. Check termination conditions
-        # Use state *after* the step for checks
-        if next_state["altitude"] < -1.0 and next_state["time"] > 1.0:
-            print(f"INFO: Loop terminated: ground hit at t={next_state['time']:.2f}s")
-            break
         # Check time at the *end* of the loop logic
-        if simulator.time >= simulator.max_duration:
-            print(
-                f"INFO: Loop terminated: max duration reached at t={simulator.time:.2f}s"
-            )
+        if simulator.done():
+            print(f"INFO: Simulation finished at t={simulator.time:.2f}s")
             break  # Exit after processing the last step
 
         # 5. Update state for next iteration
@@ -1060,3 +1007,5 @@ if __name__ == "__main__":
     save_results(
         df_state.to_dict("list"), "simulation_output_class.csv"
     )  # Example saving state
+
+    vis_results(df_state.to_dict("list"))  # Visualize with VPython
