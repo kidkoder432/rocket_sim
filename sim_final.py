@@ -5,6 +5,7 @@ import os
 from pid import PID
 from gimbal import Gimbal
 from vpython import *
+import sys
 
 # Added Protocol for the example usage block's type hint
 from typing import Tuple, Dict, Any, Optional, List, Protocol
@@ -32,7 +33,7 @@ AIR_DENSITY = 1.293
 DRAG_COEFFICIENT = 1.14
 FRONTAL_AREA = 0.00434
 # --- Rocket Parameters ---
-INITIAL_MASS_TOTAL = 0.834
+INITIAL_MASS_TOTAL = 0.968
 ENGINE1_INITIAL_MASS = 0.1018
 ENGINE1_FINAL_MASS = 0.0418
 ENGINE1_BURN_TIME = 3.45
@@ -44,7 +45,7 @@ if STRUCTURE_MASS < 0:
     print(f"Warning: Calculated STRUCTURE_MASS ({STRUCTURE_MASS:.4f} kg) is negative.")
     STRUCTURE_MASS = 0
 # --- Staging Parameters ---
-TARGET_STAGE2_IGNITION_ALTITUDE = 82
+TARGET_STAGE2_IGNITION_ALTITUDE = float(sys.argv[1]) if len(sys.argv) > 1 else -1
 STAGE2_IGNITION_WINDOW = 0.4
 # --- Initial Conditions ---
 LAUNCH_ANGLE_DEG = 15.0
@@ -61,11 +62,11 @@ MOI_STAGE1 = 0.0739
 MOMENT_ARM_STAGE2 = 0.302
 MOI_STAGE2 = 0.0612
 # --- Simulation Options ---
-ENABLE_SENSOR_NOISE = True
+ENABLE_SENSOR_NOISE = False
 SENSOR_NOISE_STD_DEV = 0.1
 ENABLE_SERVO_DELAY = True
 SERVO_DELAY_TIME = 0.04
-\
+
 
 class RocketSimulator:
     """
@@ -438,7 +439,7 @@ class RocketSimulator:
                 self.eng2_burn_time,
             )
             self.current_mass = (
-                self.structure_mass + self.eng1_final_mass + engine2_mass
+                self.structure_mass + engine2_mass
             )
             self.current_moi = self.moi_stage2
             self.current_moment_arm = self.moment_arm_stage2
@@ -446,7 +447,7 @@ class RocketSimulator:
         else:
             self.current_stage = 2.5
             self.current_mass = (
-                self.structure_mass + self.eng1_final_mass + self.eng2_final_mass
+                self.structure_mass + self.eng2_final_mass
             )
             self.current_moi = self.moi_stage2
             self.current_moment_arm = self.moment_arm_stage2
@@ -527,6 +528,9 @@ class RocketSimulator:
 
     def set_target_burn_alt(self, target_altitude: float) -> None:
         self.target_stage2_alt = target_altitude
+
+    def set_initial_mass(self, total_mass: float) -> None:
+        self.structure_mass = total_mass - self.eng1_initial_mass - self.eng2_initial_mass
 
 def plot_results(log: Dict[str, Any]):
     """
