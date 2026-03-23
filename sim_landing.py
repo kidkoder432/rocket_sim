@@ -27,8 +27,8 @@ def init_worker():
         Kd=worker_sim.config["pid_kd"],
         N=-1,
         setpoint=worker_sim.config["pid_setpoint"],
+        limits=worker_sim.config["pid_output_limits"],
         dt=worker_sim.config["delta_time"],
-        limits=worker_sim.config["gimbal_limits"],
     )
 
 
@@ -65,7 +65,7 @@ def run_sim_task(params):
 
 if __name__ == "__main__":
     # 1. Define your axes
-    alts = np.arange(30, 50, 1)
+    alts = np.arange(25, 30, 0.1)
     masses = np.arange(950, 1000, 1) / 1000
 
     # 2. Generate the Cartesian Product (Every Alt vs Every Mass)

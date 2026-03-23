@@ -3,7 +3,7 @@ from scipy.interpolate import interp1d
 from csv import reader
 import os
 from pid import PID
-from gimbal import Gimbal
+from rocket_parts import *
 from vpython import *
 import sys
 
@@ -20,9 +20,7 @@ def sign(x):
 # ==============================================================
 # --- Configuration & Constants ---
 # ==============================================================
-# (Constants remain the same as previous version)
 # --- File Paths ---
-THRUST_DATA_FILE = "f15.csv"
 OUTPUT_DATA_FILE = "simulation_data.csv"
 # --- Simulation Control ---
 SIMULATION_DURATION = 30
@@ -31,19 +29,6 @@ DELTA_TIME = 0.01
 GRAVITY = 9.80665
 AIR_DENSITY = 1.293
 DRAG_COEFFICIENT = 1.14
-FRONTAL_AREA = 0.00434
-# --- Rocket Parameters ---
-INITIAL_MASS_TOTAL = 0.968
-ENGINE1_INITIAL_MASS = 0.1018
-ENGINE1_FINAL_MASS = 0.0418
-ENGINE1_BURN_TIME = 3.45
-ENGINE2_INITIAL_MASS = ENGINE1_INITIAL_MASS
-ENGINE2_FINAL_MASS = ENGINE1_FINAL_MASS
-ENGINE2_BURN_TIME = ENGINE1_BURN_TIME
-STRUCTURE_MASS = INITIAL_MASS_TOTAL - ENGINE1_INITIAL_MASS - ENGINE2_INITIAL_MASS
-if STRUCTURE_MASS < 0:
-    print(f"Warning: Calculated STRUCTURE_MASS ({STRUCTURE_MASS:.4f} kg) is negative.")
-    STRUCTURE_MASS = 0
 # --- Staging Parameters ---
 TARGET_STAGE2_IGNITION_ALTITUDE = float(sys.argv[1]) if len(sys.argv) > 1 else -1
 STAGE2_IGNITION_WINDOW = 0.4
@@ -56,17 +41,9 @@ KD = -0.14789756
 N_FILTER = 70
 PID_SETPOINT = 0.0
 PID_OUTPUT_LIMITS = (-5, 5)
-# --- Moment Arms & Inertia ---
-MOMENT_ARM_STAGE1 = 0.29
-MOI_STAGE1 = 0.0739
-MOMENT_ARM_STAGE2 = 0.302
-MOI_STAGE2 = 0.0612
 # --- Simulation Options ---
 ENABLE_SENSOR_NOISE = False
 SENSOR_NOISE_STD_DEV = 0.1
-ENABLE_SERVO_DELAY = True
-SERVO_DELAY_TIME = 0.04
-
 
 class RocketSimulator:
     """
@@ -96,6 +73,9 @@ class RocketSimulator:
         }  # User config overrides defaults
 
         self.gimbal = Gimbal()
+        self.engine1 = Engine()
+        self.engine2 = Engine()
+        self.structure = Structure()
 
         # --- Simulation Control ---
         self.dt = self.config["delta_time"]
@@ -107,23 +87,6 @@ class RocketSimulator:
         self.g = self.config["gravity"]
         self.rho = self.config["air_density"]
         self.cd = self.config["drag_coefficient"]
-        self.frontal_area = self.config["frontal_area"]
-        self.initial_mass_total = self.config["initial_mass_total"]
-        self.eng1_initial_mass = self.config["engine1_initial_mass"]
-        self.eng1_final_mass = self.config["engine1_final_mass"]
-        self.eng1_burn_time = self.config["engine1_burn_time"]
-        self.eng2_initial_mass = self.config["engine2_initial_mass"]
-        self.eng2_final_mass = self.config["engine2_final_mass"]
-        self.eng2_burn_time = self.config["engine2_burn_time"]
-        # Structure mass is calculated, not configured directly
-        self.structure_mass = (
-            self.initial_mass_total - self.eng1_initial_mass - self.eng2_initial_mass
-        )
-        if self.structure_mass < 0:
-            print(
-                f"Warning: Calculated STRUCTURE_MASS ({self.structure_mass:.4f} kg) is negative."
-            )
-            self.structure_mass = 0
 
         # --- Staging ---
         self.target_stage2_alt = self.config["target_stage2_ignition_altitude"]
@@ -131,22 +94,11 @@ class RocketSimulator:
 
         # --- Initial & Control ---
         self.launch_angle_deg = self.config["launch_angle_deg"]
-        self.min_gimbal_angle = self.config["gimbal_limits"][0]
-        self.max_gimbal_angle = self.config["gimbal_limits"][1]
-
-        # --- Dynamics Params ---
-        self.moment_arm_stage1 = self.config["moment_arm_stage1"]
-        self.moi_stage1 = self.config["moi_stage1"]
-        self.moment_arm_stage2 = self.config["moment_arm_stage2"]
-        self.moi_stage2 = self.config["moi_stage2"]
-
-        # --- Load Thrust Data ---
-        self._load_thrust_data(self.config["thrust_data_file"])
 
         # --- Internal State Variables (initialized in reset) ---
         self.time: float = 0.0
-        self.altitude: float = 0.0
-        self.x_position: float = 0.0
+        self.position_y: float = 0.0
+        self.position_x: float = 0.0
         self.velocity_x: float = 0.0
         self.velocity_y: float = 0.0
         self.theta_radians: float = 0.0  # Actual angle
@@ -154,7 +106,7 @@ class RocketSimulator:
         self.angular_acceleration: float = 0.0  # rad/s^2 (calculated in step)
         self.current_gimbal_angle_deg: float = 0.0  # Actual angle after delay
         self.command_queue: List[Tuple[float, float]] = []
-        self.stage1_separation_time: float = self.eng1_burn_time
+        self.stage1_burnout_time: float = self.engine1.burn_time
         self.stage2_ignition_time: float = np.inf
         self.stage2_burnout_time: float = np.inf
         self.stage2_ignition_altitude: float = 0.0
@@ -176,22 +128,13 @@ class RocketSimulator:
         # This dictionary now matches the procedural script's constants
         return {
             # --- Simulation Control ---
-            "thrust_data_file": THRUST_DATA_FILE,
             "simulation_duration": SIMULATION_DURATION,
             "delta_time": DELTA_TIME,
             # --- Physical Constants ---
             "gravity": GRAVITY,
             "air_density": AIR_DENSITY,
             "drag_coefficient": DRAG_COEFFICIENT,
-            "frontal_area": FRONTAL_AREA,
             # --- Rocket Parameters ---
-            "initial_mass_total": INITIAL_MASS_TOTAL,
-            "engine1_initial_mass": ENGINE1_INITIAL_MASS,
-            "engine1_final_mass": ENGINE1_FINAL_MASS,
-            "engine1_burn_time": ENGINE1_BURN_TIME,
-            "engine2_initial_mass": ENGINE2_INITIAL_MASS,
-            "engine2_final_mass": ENGINE2_FINAL_MASS,
-            "engine2_burn_time": ENGINE2_BURN_TIME,
             # --- Staging Parameters ---
             "target_stage2_ignition_altitude": TARGET_STAGE2_IGNITION_ALTITUDE,
             "stage2_ignition_window": STAGE2_IGNITION_WINDOW,
@@ -203,72 +146,9 @@ class RocketSimulator:
             "pid_kd": KD,
             "pid_n": N_FILTER,
             "pid_setpoint": PID_SETPOINT,
-            "gimbal_limits": PID_OUTPUT_LIMITS,
-            # --- Moment Arms & Inertia ---
-            "moment_arm_stage1": MOMENT_ARM_STAGE1,
-            "moi_stage1": MOI_STAGE1,
-            "moment_arm_stage2": MOMENT_ARM_STAGE2,
-            "moi_stage2": MOI_STAGE2,
+            "pid_output_limits": PID_OUTPUT_LIMITS,
             # --- Simulation Options ---
-            "enable_servo_delay": ENABLE_SERVO_DELAY,
-            "servo_delay_time": SERVO_DELAY_TIME,
-            "enable_sensor_noise": ENABLE_SENSOR_NOISE,
-            "sensor_noise_std_dev": SENSOR_NOISE_STD_DEV,
         }
-
-    def _load_thrust_data(self, filename):
-        """Loads thrust data and creates an interpolator."""
-        # (Same as previous version)
-        self.thrust_time_points, self.thrust_force_points = [], []
-        if not os.path.exists(filename):
-            print(f"Error: Thrust file '{filename}' not found.")
-        else:
-            try:
-                with open(filename, "r") as f:
-                    csv_reader = reader(f)
-                    data = list(csv_reader)
-                points = [(float(x[0]), float(x[1])) for x in data if len(x) >= 2]
-                self.thrust_time_points = np.array([p[0] for p in points])
-                self.thrust_force_points = np.array([p[1] for p in points])
-                if len(self.thrust_time_points) == 0 or not np.all(
-                    np.diff(self.thrust_time_points) > 0
-                ):
-                    print(f"Warning: Thrust data '{filename}' bad.")
-                    self.thrust_time_points, self.thrust_force_points = [], []
-            except Exception as e:
-                print(f"Error reading thrust file '{filename}': {e}")
-                self.thrust_time_points, self.thrust_force_points = [], []
-        if len(self.thrust_time_points) > 0:
-            print("Thrust data:")
-            print("Time (s)\tThrust (N)")
-            for t, f in zip(self.thrust_time_points, self.thrust_force_points):
-                print(f"{t:.2f}\t{f:.2f}")
-            print()
-            self._thrust_interpolator = interp1d(
-                self.thrust_time_points,
-                self.thrust_force_points,
-            )
-            print(f"Thrust data loaded from '{filename}'.")
-        else:
-            print("Warning: Using dummy thrust (0).")
-            self._thrust_interpolator = lambda t: 0.0
-
-    def _thrust_at_time(self, t):
-        """Calculates thrust at a given time."""
-        if t <= 0 or t >= self.thrust_time_points[-1]:
-            return 0.0
-        return self._thrust_interpolator(t)
-
-    def _engine_mass_at_time(self, t, initial_mass, final_mass, burn_time):
-        """Calculates the mass of a single engine at time t during its burn."""
-        # (Same as previous version)
-        if t < 0:
-            return initial_mass
-        if t >= burn_time:
-            return final_mass
-        if burn_time <= 0:
-            return final_mass
-        return initial_mass + (final_mass - initial_mass) * (t / burn_time)
 
     def reset(self) -> Dict[str, Any]:
         """
@@ -278,8 +158,8 @@ class RocketSimulator:
             Dict[str, Any]: The initial state dictionary.
         """
         self.time = 0.0
-        self.altitude = 0.0
-        self.x_position = 0.0
+        self.position_y = 0.0
+        self.position_x = 0.0
         self.velocity_x = 0.0
         self.velocity_y = 0.0
         self.theta_radians = np.radians(self.config["launch_angle_deg"])
@@ -287,15 +167,15 @@ class RocketSimulator:
         self.angular_acceleration = 0.0
         self.current_gimbal_angle_deg = 0.0
         self.command_queue = []
-        self.stage1_separation_time = self.config["engine1_burn_time"]  # Use config
+        self.stage1_burnout_time = self.engine1.burn_time
         self.stage2_ignition_time = np.inf
         self.stage2_burnout_time = np.inf
         self.stage2_ignition_altitude = 0.0
         self.stage2_ignition_locked = False
         self.current_stage = 1.0
-        self.current_mass = self.config["initial_mass_total"]
-        self.current_moi = self.config["moi_stage1"]
-        self.current_moment_arm = self.config["moment_arm_stage1"]
+        self.current_mass = self.structure.mass
+        self.current_moi = self.structure.moi
+        self.current_moment_arm = self.structure.moment_arm
         self.engine_thrust = 0.0  # Will be calculated in first step if t=0
         self.is_burning = False  # Will be determined in first step
         self.drag_force_x = 0.0
@@ -303,6 +183,7 @@ class RocketSimulator:
         self.aoa = 0.0
 
         self.gimbal.reset()
+        self.structure.reset()
 
         # print(f"Environment reset. Initial angle: {np.degrees(self.theta_radians):.1f} deg") # Optional
         return self.get_current_state()
@@ -324,8 +205,8 @@ class RocketSimulator:
 
         return {
             "time": self.time,
-            "altitude": self.altitude,
-            "x_position": self.x_position,
+            "altitude": self.position_y,
+            "x_position": self.position_x,
             "velocity_x": self.velocity_x,
             "velocity_y": self.velocity_y,
             "theta_radians": self.theta_radians,  # Actual angle
@@ -361,7 +242,7 @@ class RocketSimulator:
         Returns:
             bool: True if the rocket has crashed, False otherwise.
         """
-        return self.altitude < 0.0 and self.time > 1.0
+        return self.position_y < 0.0 and self.time > 1.0
 
     def done(self) -> bool:
         """
@@ -387,79 +268,40 @@ class RocketSimulator:
         gimbal_radians = self.gimbal.get_rad()
         self.current_gimbal_angle_deg = self.gimbal.get_deg()
 
+        self.engine1.update(self.time)
+        self.engine2.update(self.time - self.stage2_ignition_time)
+        self.engine_thrust = self.engine1.thrust + self.engine2.thrust
+        self.current_mass, self.current_moment_arm, self.current_moi = (
+            self.structure.update(self.engine1.mass, self.engine2.mass)
+        )
+
         # --- 2. Update Stage & Dynamics ---
         # Determine current stage, mass, moi, moment_arm, thrust, burning status
         # This logic is identical to the procedural version.
         self.is_burning = False
-        self.engine_thrust = 0.0
-        if self.time < self.stage1_separation_time:
+
+        if self.time < self.stage1_burnout_time:
             self.current_stage = 1.0
-            engine_time = self.time
-            self.engine_thrust = self._thrust_at_time(engine_time)
-            engine1_mass = self._engine_mass_at_time(
-                engine_time,
-                self.eng1_initial_mass,
-                self.eng1_final_mass,
-                self.eng1_burn_time,
-            )
-            self.current_mass = (
-                self.structure_mass + engine1_mass + self.eng2_initial_mass
-            )
-            self.current_moi = self.moi_stage1
-            self.current_moment_arm = self.moment_arm_stage1
             self.is_burning = True
         elif self.time < self.stage2_ignition_time:
             self.current_stage = 1.5
-            self.current_mass = (
-                self.structure_mass + self.eng1_final_mass + self.eng2_initial_mass
-            )
-            self.current_moi = self.moi_stage1
-            self.current_moment_arm = self.moment_arm_stage1
-            # Check stage 2 ignition (identical logic)
             if (
                 not self.stage2_ignition_locked
                 and self.velocity_y < 0
-                and abs(self.altitude - self.target_stage2_alt)
+                and abs(self.position_y - self.target_stage2_alt)
                 <= self.stage2_alt_window
             ):
                 self.stage2_ignition_time = self.time
-                self.stage2_ignition_altitude = self.altitude
+                self.stage2_ignition_altitude = self.position_y
                 self.stage2_burnout_time = (
-                    self.stage2_ignition_time + self.eng2_burn_time
+                    self.stage2_ignition_time + self.engine2.burn_time
                 )
                 self.stage2_ignition_locked = True
         elif self.time < self.stage2_burnout_time:
             self.current_stage = 2.0
-            engine_time = self.time - self.stage2_ignition_time
-            self.engine_thrust = self._thrust_at_time(engine_time)
-            engine2_mass = self._engine_mass_at_time(
-                engine_time,
-                self.eng2_initial_mass,
-                self.eng2_final_mass,
-                self.eng2_burn_time,
-            )
-            self.current_mass = (
-                self.structure_mass + engine2_mass
-            )
-            self.current_moi = self.moi_stage2
-            self.current_moment_arm = self.moment_arm_stage2
             self.is_burning = True
         else:
             self.current_stage = 2.5
-            self.current_mass = (
-                self.structure_mass + self.eng2_final_mass
-            )
-            self.current_moi = self.moi_stage2
-            self.current_moment_arm = self.moment_arm_stage2
-
-        # Safety check for mass
-        if self.current_mass <= 0:
-            print(
-                f"Error: Mass non-positive ({self.current_mass:.4f}) at t={self.time:.2f}. Step skipped."
-            )
-            # Return current state without advancing time if mass is invalid
-            # This prevents division by zero in physics calcs
-            return self.get_current_state()
 
         # --- 3. Calculate Physics ---
         # Use state determined *for this step* (thrust, mass, moi, moment_arm, gimbal_radians)
@@ -471,7 +313,7 @@ class RocketSimulator:
             * self.rho
             * ((self.velocity_x * self.speed) if self.speed > 0 else 0.0)
             * self.cd
-            * self.frontal_area
+            * self.structure.frontal_area
         )
 
         self.drag_force_y = (
@@ -479,27 +321,21 @@ class RocketSimulator:
             * self.rho
             * ((self.velocity_y * self.speed) if self.speed > 0 else 0.0)
             * self.cd
-            * self.frontal_area
+            * self.structure.frontal_area
         )
 
-        gravity_force_y = -self.g * self.current_mass
+        gravity_force_y = self.g * self.current_mass
         total_angle_radians = (
             self.theta_radians + gimbal_radians
         )  # Angle of thrust vector in world frame
         force_x = thrust_force * np.sin(total_angle_radians) - self.drag_force_x
-        force_y = (
-            thrust_force * np.cos(total_angle_radians)
-            + gravity_force_y
-            + self.drag_force_y
-        )
+        force_y = thrust_force * np.cos(total_angle_radians) - self.drag_force_y - gravity_force_y
+        
         acceleration_x = force_x / self.current_mass
         acceleration_y = force_y / self.current_mass
+        
         torque = -thrust_force * np.sin(gimbal_radians) * self.current_moment_arm
-        # Calculate angular acceleration *for this step*
-        if self.current_moi <= 0:
-            self.angular_acceleration = 0.0
-        else:
-            self.angular_acceleration = torque / self.current_moi
+        self.angular_acceleration = torque / self.current_moi
 
         self.move_angle = np.arctan2(self.velocity_y, self.velocity_x)
         self.aoa = np.degrees(self.theta_radians - self.move_angle) + 90
@@ -515,22 +351,23 @@ class RocketSimulator:
         if acceleration_y < 0 and self.time < 1:
             self.velocity_y = max(0, self.velocity_y)
 
-        self.x_position += self.velocity_x * self.dt
-        self.altitude += self.velocity_y * self.dt
+        self.position_x += self.velocity_x * self.dt
+        self.position_y += self.velocity_y * self.dt
+       
         self.angular_velocity += self.angular_acceleration * self.dt
         self.theta_radians += self.angular_velocity * self.dt
-        # Advance time *after* all calculations for this step are done
+
         self.time += self.dt
 
         # --- 5. Return New State and Check for Done ---
-        # The state dictionary reflects the results *after* this step's integration
         return self.get_current_state(), self.done()
 
     def set_target_burn_alt(self, target_altitude: float) -> None:
         self.target_stage2_alt = target_altitude
 
     def set_initial_mass(self, total_mass: float) -> None:
-        self.structure_mass = total_mass - self.eng1_initial_mass - self.eng2_initial_mass
+        self.structure.wet_mass = total_mass
+
 
 def plot_results(log: Dict[str, Any]):
     """
@@ -892,51 +729,9 @@ from plotly.subplots import make_subplots
 if __name__ == "__main__":
     print("Running General Rocket Simulator Example...")
 
-    # --- Configuration ---
-    sim_config = {
-        # --- Simulation Control ---
-        "thrust_data_file": THRUST_DATA_FILE,
-        "simulation_duration": SIMULATION_DURATION,
-        "delta_time": DELTA_TIME,
-        # --- Physical Constants ---
-        "gravity": GRAVITY,
-        "air_density": AIR_DENSITY,
-        "drag_coefficient": DRAG_COEFFICIENT,
-        "frontal_area": FRONTAL_AREA,
-        # --- Rocket Parameters ---
-        "initial_mass_total": INITIAL_MASS_TOTAL,
-        "engine1_initial_mass": ENGINE1_INITIAL_MASS,
-        "engine1_final_mass": ENGINE1_FINAL_MASS,
-        "engine1_burn_time": ENGINE1_BURN_TIME,
-        "engine2_initial_mass": ENGINE2_INITIAL_MASS,
-        "engine2_final_mass": ENGINE2_FINAL_MASS,
-        "engine2_burn_time": ENGINE2_BURN_TIME,
-        # --- Staging Parameters ---
-        "target_stage2_ignition_altitude": TARGET_STAGE2_IGNITION_ALTITUDE,
-        "stage2_ignition_window": STAGE2_IGNITION_WINDOW,
-        # --- Initial Conditions ---
-        "launch_angle_deg": LAUNCH_ANGLE_DEG,
-        # --- Control System Parameters ---
-        "pid_kp": KP,
-        "pid_ki": KI,
-        "pid_kd": KD,
-        "pid_n": N_FILTER,
-        "pid_setpoint": PID_SETPOINT,
-        "gimbal_limits": PID_OUTPUT_LIMITS,
-        # --- Moment Arms & Inertia ---
-        "moment_arm_stage1": MOMENT_ARM_STAGE1,
-        "moi_stage1": MOI_STAGE1,
-        "moment_arm_stage2": MOMENT_ARM_STAGE2,
-        "moi_stage2": MOI_STAGE2,
-        # --- Simulation Options ---
-        "enable_servo_delay": ENABLE_SERVO_DELAY,
-        "servo_delay_time": SERVO_DELAY_TIME,
-        "enable_sensor_noise": ENABLE_SENSOR_NOISE,
-        "sensor_noise_std_dev": SENSOR_NOISE_STD_DEV,
-    }
-
     # --- Initialization ---
-    simulator = RocketSimulator(config=sim_config)
+    simulator = RocketSimulator()
+
     # Define PID parameters based on procedural script's constants
     controller = PID(
         Kp=simulator.config["pid_kp"],
@@ -944,8 +739,8 @@ if __name__ == "__main__":
         Kd=simulator.config["pid_kd"],
         N=simulator.config["pid_n"],
         setpoint=simulator.config["pid_setpoint"],
+        limits=simulator.config["pid_output_limits"],
         dt=simulator.config["delta_time"],
-        limits=simulator.config["gimbal_limits"],
     )
 
     # controller = DummyController(20)
