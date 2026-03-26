@@ -111,8 +111,8 @@ class PID:
             D = 0.0
 
         # --- Calculate Pre-Saturated Output ---
-        output = P + I + D
-        self.last_components = (P, I, D)
+        output = P + I - D
+        self.last_components = (P, I, -D)
 
         # --- Apply Saturation Internally ---
         output_saturated = np.clip(output, self._limits[0], self._limits[1])
@@ -130,7 +130,7 @@ class PID:
         self._previous_measurement_deg = measurement_deg
 
         # --- Return Control Output ---
-        return -output_saturated
+        return output_saturated
 
     def reset(self):
         """Resets the integral and derivative states."""
