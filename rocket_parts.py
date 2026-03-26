@@ -23,7 +23,7 @@ DEFAULT_STRUCTURE_CONFIG = {
     "dry_mass": 0.959 - 0.2036,
     "wet_mass": 0.959,
     "x_cg": 0.846,
-    "x_t": 0.553,
+    "x_t": 1.05,
     "moi_initial": 0.0739,
     "frontal_area": 0.00434,
 }
@@ -194,7 +194,7 @@ class Structure:
 
         self.current_cg = (self.dry_mass * self.cg_dry + total_engine_mass * self.x_t) / self.mass
 
-        self.moment_arm = abs(self.x_t - self.x_cg)
+        self.moment_arm = abs(self.x_t - self.current_cg)
 
         self.moi = (self.moi_dry
             + (self.current_cg - self.cg_dry)**2 * self.dry_mass
