@@ -37,13 +37,14 @@ LAUNCH_ANGLE_DEG = 15.0
 # --- Control System Parameters ---
 KP = 1.44168417
 KI = 2.64033837
-KD = -0.14789756
+KD = 0.14789756
 N_FILTER = 70
 PID_SETPOINT = 0.0
 PID_OUTPUT_LIMITS = (-5, 5)
 # --- Simulation Options ---
 ENABLE_SENSOR_NOISE = False
 SENSOR_NOISE_STD_DEV = 0.1
+
 
 class RocketSimulator:
     """
@@ -95,30 +96,36 @@ class RocketSimulator:
         # --- Initial & Control ---
         self.launch_angle_deg = self.config["launch_angle_deg"]
 
+        # vectors
+        self.pos = np.array([0.0, 0.0])
+        self.vel_g = np.array([0.0, 0.0])
+        self.vel_b = np.array([0.0, 0.0])
+        self.accel_g = np.array([0.0, 0.0])
+        self.accel_b = np.array([0.0, 0.0])
+        self.drag_g = np.array([0.0, 0.0])
+        self.drag_b = np.array([0.0, 0.0])
+
         # --- Internal State Variables (initialized in reset) ---
         self.time: float = 0.0
-        self.position_y: float = 0.0
-        self.position_x: float = 0.0
-        self.velocity_x: float = 0.0
-        self.velocity_y: float = 0.0
         self.theta_radians: float = 0.0  # Actual angle
         self.angular_velocity: float = 0.0  # rad/s
         self.angular_acceleration: float = 0.0  # rad/s^2 (calculated in step)
         self.current_gimbal_angle_deg: float = 0.0  # Actual angle after delay
-        self.command_queue: List[Tuple[float, float]] = []
+
         self.stage1_burnout_time: float = self.engine1.burn_time
         self.stage2_ignition_time: float = np.inf
         self.stage2_burnout_time: float = np.inf
         self.stage2_ignition_altitude: float = 0.0
         self.stage2_ignition_locked: bool = False
+
         self.current_stage: float = 1.0
         self.current_mass: float = 0.0
         self.current_moi: float = 0.0
         self.current_moment_arm: float = 0.0
+
         self.engine_thrust: float = 0.0
         self.is_burning: bool = False
-        self.drag_force_x: float = 0.0  # Store last calculated drag
-        self.drag_force_y: float = 0.0  # Store last calculated drag
+
         self.aoa: float = 0.0  # Angle of attack in degrees
 
         print("General RocketSimulator initialized.")
@@ -253,6 +260,24 @@ class RocketSimulator:
         """
         return self._overtime() or self._crashed()
 
+    def b2g(self, vec_b, theta):
+
+        Rmat = np.array([
+            [np.cos(theta), -np.sin(theta)], 
+            [np.sin(theta), np.cos(theta)]
+        ])
+
+        return np.matmul(Rmat, vec_b)
+
+    def g2b(self, vec_g, theta):
+
+        Rmat = np.array([
+            [np.cos(theta), -np.sin(theta)], 
+            [np.sin(theta), np.cos(theta)]
+        ])
+
+        return np.matmul(Rmat.T, vec_g)
+
     def step(self, gimbal_command_deg: float) -> Tuple[Dict[str, Any], bool]:
         """
         Runs one time step of the simulation using the provided gimbal command.
@@ -265,7 +290,7 @@ class RocketSimulator:
         """
 
         self.gimbal(gimbal_command_deg, self.time)
-        gimbal_radians = self.gimbal.get_rad()
+        gimbal_radians = -self.gimbal.get_rad() # positive theta -> negative error -> positive gimbal
         self.current_gimbal_angle_deg = self.gimbal.get_deg()
 
         self.engine1.update(self.time)
@@ -308,52 +333,39 @@ class RocketSimulator:
         thrust_force = self.engine_thrust
         self.speed = np.sqrt(self.velocity_x**2 + self.velocity_y**2)
 
-        self.drag_force_x = (
-            0.5
-            * self.rho
-            * ((self.velocity_x * self.speed) if self.speed > 0 else 0.0)
-            * self.cd
-            * self.structure.frontal_area
+        drag_axial = 0.5 * self.rho * self.speed**2 * self.structure.frontal_area
+        drag_force_b = np.array([0, -drag_axial])
+
+        gravity_force_g = np.array([0, -self.g]) * self.current_mass
+        gravity_force_b = self.g2b(gravity_force_g, self.theta_radians)
+
+        thrust_force_b = np.array([-thrust_force * np.sin(gimbal_radians), thrust_force * np.cos(gimbal_radians)])
+
+        self.accel_b = 1 / self.current_mass * (
+            gravity_force_b + drag_force_b + thrust_force_b
         )
 
-        self.drag_force_y = (
-            0.5
-            * self.rho
-            * ((self.velocity_y * self.speed) if self.speed > 0 else 0.0)
-            * self.cd
-            * self.structure.frontal_area
-        )
+        self.accel_g = self.b2g(self.accel_b, self.theta_radians)
 
-        gravity_force_y = self.g * self.current_mass
-        total_angle_radians = (
-            self.theta_radians + gimbal_radians
-        )  # Angle of thrust vector in world frame
-        force_x = thrust_force * np.sin(total_angle_radians) - self.drag_force_x
-        force_y = thrust_force * np.cos(total_angle_radians) - self.drag_force_y - gravity_force_y
-        
-        acceleration_x = force_x / self.current_mass
-        acceleration_y = force_y / self.current_mass
-        
-        torque = -thrust_force * np.sin(gimbal_radians) * self.current_moment_arm
-        self.angular_acceleration = torque / self.current_moi
+        self.torque = self.current_moment_arm * thrust_force_b[0]
+        self.angular_acceleration = self.torque / self.current_moi
 
-        self.move_angle = np.arctan2(self.velocity_y, self.velocity_x)
-        self.aoa = np.degrees(self.theta_radians - self.move_angle) + 90
+        self.vel_b += self.accel_b * self.dt
 
-        if self.velocity_y <= 0:
-            self.aoa = 0
+        self.vel_g = self.b2g(self.vel_b, self.theta_radians)
 
-        # --- 4. Integrate State ---
-        # Update state variables based on accelerations calculated *this step*
-        self.velocity_x += acceleration_x * self.dt
-        self.velocity_y += acceleration_y * self.dt
+        if self.time < 1 and self.accel_g[1] < 0:
+            self.vel_g[1] = max(self.vel_g[1], 0)
+            self.vel_b = self.g2b(self.vel_g, self.theta_radians)
 
-        if acceleration_y < 0 and self.time < 1:
-            self.velocity_y = max(0, self.velocity_y)
+        self.pos += self.vel_g * self.dt
 
-        self.position_x += self.velocity_x * self.dt
-        self.position_y += self.velocity_y * self.dt
-       
+
+        self.velocity_x = self.vel_g[0]
+        self.velocity_y = self.vel_g[1]
+        self.position_x = self.pos[0]
+        self.position_y = self.pos[1]
+
         self.angular_velocity += self.angular_acceleration * self.dt
         self.theta_radians += self.angular_velocity * self.dt
 
