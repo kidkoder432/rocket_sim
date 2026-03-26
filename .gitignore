@@ -3,5 +3,5 @@ extra/
 pyrocketsim.zip
 myplot.png
 .idea
-__pycache__/
+__pycache__
 simulation_output_class.csv
